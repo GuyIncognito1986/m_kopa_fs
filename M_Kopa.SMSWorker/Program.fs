@@ -72,8 +72,7 @@ module Program =
             let deadLetteredMessage = MessageDeadLettered(message)
             diContainer.stateServiceClient.SetState(deadLetteredMessage)
             runStateMachine(deadLetteredMessage, diContainer)
-        while not(SmsWorkerStates.IsFiniteState(currentState)) do
-            match currentState with
+        match currentState with
                 | Running(m) -> match diContainer.queueClient.DeserializeMessage(m) with
                                     | Ok(v) -> let deserializedMessage = Deserialized(v)
                                                diContainer.stateServiceClient.SetState(deserializedMessage)
@@ -92,6 +91,7 @@ module Program =
                                          diContainer.stateServiceClient.SetState(successfulMessage)
                                          runStateMachine(successfulMessage, diContainer)
                 | _ -> ()
+            
                 
     let stateMachineToTask(currentState: SmsWorkerStates, diContainer: DiContainer) = task {
         runStateMachine(currentState, diContainer)
