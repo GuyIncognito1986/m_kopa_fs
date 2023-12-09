@@ -44,17 +44,20 @@ module Program =
         abstract member PublishToDeadLetter: Byte[] -> ServiceBusResponse
         abstract member PublishToServiceBus: Byte[] -> ServiceBusResponse
          
+    type DeadLetterType =
+        | DeserializationFailed of Byte[]
+        | ValidationFailed of SendSMSCommand
+        
     type SmsWorkerStates =
-        | Initial
         | Running of message: Byte[]
         | Deserialized of message: SendSMSCommand
-        | MessageSendSuccessful
-        | MessageDeadLettered
+        | MessageSendSuccessful of correlationId: Cuid2
+        | MessageDeadLettered of message: DeadLetterType
         | MessageValidated of message: SendSMSCommand
         static member IsFiniteState(state: SmsWorkerStates) =
             match state with
-                | MessageSendSuccessful
-                | MessageDeadLettered -> true
+                | MessageSendSuccessful(_)
+                | MessageDeadLettered(_) -> true
                 | _ -> false
     
     type IStateServiceClient =
@@ -63,29 +66,31 @@ module Program =
         
     type DiContainer = { serviceBusClient: IServiceBusClient; eventHubClient: IEventHubClient; queueClient: IQueueClient; stateServiceClient: IStateServiceClient }
     
-    type DeadLetterType =
-        | DeserializationFailed of Byte[]
-        | ValidationFailed of SendSMSCommand
-           
     let rec runStateMachine(currentState: SmsWorkerStates, diContainer: DiContainer) =
-        diContainer.stateServiceClient.SetState(currentState)
         let toDeadLetter (message: DeadLetterType, diContainer: DiContainer) =
             diContainer.serviceBusClient.Serialize(message) |> diContainer.serviceBusClient.PublishToDeadLetter |> ignore
-            runStateMachine(MessageDeadLettered, diContainer)
+            let deadLetteredMessage = MessageDeadLettered(message)
+            diContainer.stateServiceClient.SetState(deadLetteredMessage)
+            runStateMachine(deadLetteredMessage, diContainer)
         while not(SmsWorkerStates.IsFiniteState(currentState)) do
             match currentState with
                 | Running(m) -> match diContainer.queueClient.DeserializeMessage(m) with
-                                    | Ok(v) -> runStateMachine(Deserialized(v), diContainer)
-                                               diContainer.stateServiceClient.SetState(Deserialized(v))
+                                    | Ok(v) -> let deserializedMessage = Deserialized(v)
+                                               diContainer.stateServiceClient.SetState(deserializedMessage)
+                                               runStateMachine(deserializedMessage, diContainer)
                                     | _ -> toDeadLetter(DeserializationFailed(m), diContainer)
                 | Deserialized(m) -> let state = diContainer.stateServiceClient.GetState(m.CorrelationId)
                                      match state with
                                         | s when SmsWorkerStates.IsFiniteState(s) -> ()
-                                        | _ when validateSendSmsCommand(m) -> runStateMachine(MessageValidated(m), diContainer) 
+                                        | _ when validateSendSmsCommand(m) -> let validMessage = MessageValidated(m)
+                                                                              diContainer.stateServiceClient.SetState(validMessage)
+                                                                              runStateMachine(validMessage, diContainer)
                                         | _ -> toDeadLetter(ValidationFailed(m), diContainer)
                 | MessageValidated(m) -> let serializedMessage = diContainer.serviceBusClient.Serialize(m)
                                          diContainer.serviceBusClient.PublishToServiceBus(serializedMessage) |> ignore
-                                         runStateMachine(MessageSendSuccessful, diContainer)
+                                         let successfulMessage = MessageSendSuccessful(m.CorrelationId)
+                                         diContainer.stateServiceClient.SetState(successfulMessage)
+                                         runStateMachine(successfulMessage, diContainer)
                 | _ -> ()
                 
     let stateMachineToTask(currentState: SmsWorkerStates, diContainer: DiContainer) = task {
